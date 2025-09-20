@@ -1,6 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace HangulJasoFixer2
@@ -8,6 +11,7 @@ namespace HangulJasoFixer2
     public partial class FormSearching : Form
     {
         private SearchArguments searchArguments;
+        private CancellationTokenSource _cancellationTokenSource;
 
         public FormSearching()
         {
@@ -21,16 +25,8 @@ namespace HangulJasoFixer2
 
         private void ButtonCancel_Click(object sender, EventArgs e)
         {
-            StopSignalToBackgroundWorker();
+            _cancellationTokenSource?.Cancel();
             buttonCancel.Enabled = false;
-        }
-
-        private void StopSignalToBackgroundWorker()
-        {
-            if (backgroundWorkerSearch.IsBusy)
-            {
-                backgroundWorkerSearch.CancelAsync();
-            }
         }
 
         private void FormSearching_Shown(object sender, EventArgs e)
@@ -42,55 +38,62 @@ namespace HangulJasoFixer2
         {
             var searchArgs = e.Argument as SearchArguments;
             searchArgs.ClearRows();
-            SearchWork(sender as BackgroundWorker, searchArgs);
+
+            _cancellationTokenSource = new CancellationTokenSource();
+
+            try
+            {
+                SearchRecursivelyAsync(searchArgs, _cancellationTokenSource.Token).Wait();
+            }
+            catch (OperationCanceledException)
+            {
+                e.Cancel = true;
+            }
         }
 
-        private void SearchWork(BackgroundWorker worker, SearchArguments args)
+        private async Task SearchRecursivelyAsync(SearchArguments args, CancellationToken token)
         {
-            var directoryInfo = new DirectoryInfo(args.RootPath);
-            foreach (var fi in directoryInfo.GetFiles())
+            token.ThrowIfCancellationRequested();
+
+            try
             {
-                args.SetCurrentFileLable(fi.Name);
-                if (worker.CancellationPending)
+                var directoryInfo = new DirectoryInfo(args.RootPath);
+
+                foreach (var fi in directoryInfo.GetFiles())
                 {
-                    return;
+                    token.ThrowIfCancellationRequested();
+                    args.SetCurrentFileLable(fi.Name);
+                    if (!fi.Name.IsNormalized())
+                    {
+                        string fixedFullName = Path.Combine(fi.DirectoryName, fi.Name.Normalize());
+                        args.AddRow(fi.FullName, fixedFullName, "파일");
+                    }
                 }
-                if (!fi.Name.IsNormalized())
+
+                var subDirectories = directoryInfo.GetDirectories();
+                var tasks = new List<Task>();
+
+                foreach (var di in subDirectories)
                 {
-                    string fixedFullName = Path.Combine(fi.DirectoryName, fi.Name.Normalize());
-                    args.AddRow(fi.FullName, fixedFullName, "파일");
+                    token.ThrowIfCancellationRequested();
+
+                    if (args.IsIncludeSubDirectory)
+                    {
+                        tasks.Add(SearchRecursivelyAsync(args.Clone(di.FullName), token));
+                    }
+
+                    args.SetCurrentFileLable(di.Name);
+                    if (args.IsIncludeDirectory && !Path.GetFileName(di.FullName).IsNormalized())
+                    {
+                        string fixedFullName = Path.Combine(Path.GetDirectoryName(di.FullName), Path.GetFileName(di.FullName).Normalize());
+                        args.AddRow(di.FullName, fixedFullName, "폴더");
+                    }
                 }
+
+                await Task.WhenAll(tasks);
             }
-
-            foreach (var di in directoryInfo.GetDirectories())
+            catch (UnauthorizedAccessException)
             {
-                if (worker.CancellationPending)
-                {
-                    return;
-                }
-                if (args.IsIncludeSubDirectory)
-                {
-                    SearchWork(worker, args.Clone(di.FullName));
-                }
-                args.SetCurrentFileLable(di.Name);
-
-                if (!args.IsIncludeDirectory)
-                {
-                    continue;
-                }
-                string parentDirectory = Path.GetDirectoryName(di.FullName);
-                string currentDirectory = Path.GetFileName(di.FullName);
-                if ((parentDirectory == null || parentDirectory == String.Empty) && !currentDirectory.IsNormalized())
-                {
-                    args.AddRow(di.FullName, di.FullName, "폴더");
-                }
-                
-                if (!currentDirectory.IsNormalized())
-                {
-                    // 순서상 서브 디렉토리의 변경이 먼저 되어야 하기 때문에 디렉토리는 나중에 넣는다.
-                    string fixedFullName = Path.Combine(parentDirectory, currentDirectory.Normalize());
-                    args.AddRow(di.FullName, fixedFullName, "폴더");
-                }
             }
         }
 
@@ -106,7 +109,7 @@ namespace HangulJasoFixer2
 
         private void FormSearching_FormClosing(object sender, FormClosingEventArgs e)
         {
-            StopSignalToBackgroundWorker();
+            _cancellationTokenSource?.Cancel();
         }
     }
 }
